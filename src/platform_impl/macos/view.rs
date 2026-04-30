@@ -407,11 +407,38 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
-            // Commit only if we have marked text.
-            if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
-                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                self.ivars().ime_state.set(ImeState::Committed);
+            // Treat this as IME input when either (a) there is marked text
+            // (we are mid-composition) or (b) the active input source is an
+            // input method (e.g. Korean Gureum) that delivers punctuation
+            // through `insertText:` even without composition. Without (b),
+            // an IME on a non-Qwerty layout (e.g. Dvorak) would lose `.`
+            // `,` `;` because the underlying layout reinterprets the
+            // physical key (`v` `w` `s`) when winit falls back to
+            // `KeyboardInput` instead of an `Ime::Commit`.
+            let ime_active = unsafe { self.hasMarkedText() } || self.is_input_source_ime();
+
+            if !is_control && ime_active {
+                if self.ivars().ime_state.get() == ImeState::Committed {
+                    // After committing composed text (e.g., Korean "한"), the
+                    // IME may send a second `insertText:` for the triggering
+                    // character (e.g., space or punctuation). Forward it as a
+                    // regular key event instead of committing again, which
+                    // would otherwise cause double input.
+                    self.ivars().forward_key_to_app.set(true);
+                } else {
+                    if self.ivars().ime_state.get() == ImeState::Disabled {
+                        *self.ivars().input_source.borrow_mut() = self.current_input_source();
+                        self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                    }
+                    // Clear marked text immediately as required by the
+                    // NSTextInputClient protocol. This prevents subsequent
+                    // `insertText:` calls in the same `keyDown:` from
+                    // incorrectly seeing stale marked text.
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                    self.ivars().ime_state.set(ImeState::Committed);
+                }
             }
         }
 
@@ -420,12 +447,6 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
-            // We shouldn't forward any character from just committed text, since we'll end up sending
-            // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
-            // which is not desired given it was used to confirm IME input.
-            if self.ivars().ime_state.get() == ImeState::Committed {
-                return;
-            }
 
             self.ivars().forward_key_to_app.set(true);
 
@@ -853,6 +874,43 @@ impl WinitView {
             .selectedKeyboardInputSource()
             .map(|input_source| input_source.to_string())
             .unwrap_or_default()
+    }
+
+    /// Returns `true` when the current keyboard input source is an input
+    /// method (e.g. Korean Gureum, Japanese Kotoeri) rather than a plain
+    /// keyboard layout (e.g. US Qwerty, Dvorak).
+    ///
+    /// We use this to decide whether `insertText:` calls without preceding
+    /// marked text should be treated as IME commits. Korean IMEs like
+    /// Gureum deliver punctuation (`.`, `,`, `;`) via `insertText:` even
+    /// when no Hangul is being composed, and routing those through
+    /// `Ime::Commit` prevents the underlying layout (e.g. Dvorak) from
+    /// reinterpreting the physical key on the way out via `NSEvent.characters`.
+    ///
+    /// Note: `kTISPropertyInputSourceCategory` is too coarse — both plain
+    /// keyboard layouts and IMEs share the `kTISCategoryKeyboardInputSource`
+    /// category. `kTISPropertyInputSourceType` is the right discriminator,
+    /// where `kTISTypeKeyboardLayout` identifies plain layouts and any
+    /// other type identifies an IME variant.
+    fn is_input_source_ime(&self) -> bool {
+        unsafe {
+            let source = super::ffi::TISCopyCurrentKeyboardInputSource();
+            if source.is_null() {
+                return false;
+            }
+            let ty = super::ffi::TISGetInputSourceProperty(
+                source,
+                super::ffi::kTISPropertyInputSourceType,
+            );
+            let is_layout = !ty.is_null()
+                && core_foundation::base::CFEqual(
+                    ty as core_foundation::base::CFTypeRef,
+                    super::ffi::kTISTypeKeyboardLayout as core_foundation::base::CFTypeRef,
+                ) != 0;
+            let is_ime = !ty.is_null() && !is_layout;
+            core_foundation::base::CFRelease(source as *mut std::ffi::c_void);
+            is_ime
+        }
     }
 
     pub(super) fn cursor_icon(&self) -> Retained<NSCursor> {

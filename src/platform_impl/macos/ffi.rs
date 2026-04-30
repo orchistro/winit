@@ -187,6 +187,8 @@ pub const kUCKeyTranslateNoDeadKeysMask: OptionBits = 1;
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     pub static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
+    pub static kTISPropertyInputSourceType: CFStringRef;
+    pub static kTISTypeKeyboardLayout: CFStringRef;
 
     #[allow(non_snake_case)]
     pub fn TISGetInputSourceProperty(
@@ -195,6 +197,7 @@ extern "C" {
     ) -> *mut c_void;
 
     pub fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
+    pub fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
 
     pub fn LMGetKbdType() -> u8;
 
