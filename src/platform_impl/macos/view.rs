@@ -131,6 +131,20 @@ pub struct ViewState {
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
 
+    /// True while the current `keyDown:` is processing an event with an
+    /// Alt (Option) modifier. Used inside `insertText:` so that IME
+    /// commits originating from an Alt-modified key (e.g. Korean Gureum
+    /// translating Alt+B to "b" via its roman mapping) are not routed
+    /// through `Ime::Commit`, which would bypass the application's
+    /// Alt-as-Esc / `option_as_alt` handling.
+    current_keydown_alt_held: Cell<bool>,
+
+    /// Set to `true` in `insertText:` whenever it emits an `Ime::Commit`
+    /// during the current `keyDown:`. Used by the keyDown post-processing
+    /// to decide whether to perform a rescue commit for an Alt-discarded
+    /// preedit.
+    current_keydown_committed_via_ime: Cell<bool>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -407,11 +421,52 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
-            // Commit only if we have marked text.
-            if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
-                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                self.ivars().ime_state.set(ImeState::Committed);
+            let has_marked = unsafe { self.hasMarkedText() };
+            let is_ime_src = self.is_input_source_ime();
+            let alt_held = self.ivars().current_keydown_alt_held.get();
+
+            // Treat this as IME input when either (a) there is marked text
+            // (we are mid-composition) or (b) the active input source is an
+            // input method (e.g. Korean Gureum) that delivers punctuation
+            // through `insertText:` even without composition. Without (b),
+            // an IME on a non-Qwerty layout (e.g. Dvorak) would lose `.`
+            // `,` `;` because the underlying layout reinterprets the
+            // physical key (`v` `w` `s`) when winit falls back to
+            // `KeyboardInput` instead of an `Ime::Commit`.
+            let ime_active = has_marked || is_ime_src;
+
+            if !is_control && ime_active {
+                if alt_held {
+                    // The IME committed text in response to an Alt-modified
+                    // keypress (e.g. Gureum's roman mapping turning Alt+B
+                    // into "b"). Don't route through `Ime::Commit` — that
+                    // would bypass the application's Alt-as-Esc /
+                    // `option_as_alt` handling. Force a `KeyboardInput` so
+                    // the original key event reaches the app with its
+                    // modifier state intact.
+                    self.ivars().forward_key_to_app.set(true);
+                } else if self.ivars().ime_state.get() == ImeState::Committed {
+                    // After committing composed text (e.g., Korean "한"), the
+                    // IME may send a second `insertText:` for the triggering
+                    // character (e.g., space or punctuation). Forward it as a
+                    // regular key event instead of committing again, which
+                    // would otherwise cause double input.
+                    self.ivars().forward_key_to_app.set(true);
+                } else {
+                    if self.ivars().ime_state.get() == ImeState::Disabled {
+                        *self.ivars().input_source.borrow_mut() = self.current_input_source();
+                        self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                    }
+                    // Clear marked text immediately as required by the
+                    // NSTextInputClient protocol. This prevents subsequent
+                    // `insertText:` calls in the same `keyDown:` from
+                    // incorrectly seeing stale marked text.
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                    self.ivars().ime_state.set(ImeState::Committed);
+                    self.ivars().current_keydown_committed_via_ime.set(true);
+                }
             }
         }
 
@@ -420,12 +475,6 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
-            // We shouldn't forward any character from just committed text, since we'll end up sending
-            // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
-            // which is not desired given it was used to confirm IME input.
-            if self.ivars().ime_state.get() == ImeState::Committed {
-                return;
-            }
 
             self.ivars().forward_key_to_app.set(true);
 
@@ -452,6 +501,28 @@ declare_class!(
                 }
             }
 
+            // Stash whether Alt is held for this `keyDown:` so `insert_text`
+            // can avoid routing IME commits triggered by an Alt-modified key
+            // through `Ime::Commit` (which would bypass Alt-as-Esc handling).
+            let alt_held = lalt_pressed(event) || ralt_pressed(event);
+            self.ivars().current_keydown_alt_held.set(alt_held);
+            self.ivars().current_keydown_committed_via_ime.set(false);
+
+            // If Alt is held while there is an in-progress preedit, capture
+            // its content now (before `interpretKeyEvents:` runs). Some IMEs
+            // (e.g. Gureum on macOS) discard the in-progress preedit via
+            // `unmarkText` when an Alt-modified key arrives instead of
+            // committing it. We use this captured snapshot to perform a
+            // rescue commit after `interpretKeyEvents:` if the IME failed
+            // to commit the preedit itself.
+            let preedit_at_start = if alt_held && unsafe { self.hasMarkedText() } {
+                let marked = self.ivars().marked_text.borrow();
+                let s = marked.string().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            } else {
+                None
+            };
+
             // Get the characters from the event.
             let old_ime_state = self.ivars().ime_state.get();
             self.ivars().forward_key_to_app.set(false);
@@ -471,6 +542,20 @@ declare_class!(
                 if self.ivars().ime_state.get() == ImeState::Committed {
                     // Remove any marked text, so normal input can continue.
                     *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                }
+            }
+
+            // Rescue commit: if Alt was held while a preedit was in
+            // progress, and the IME didn't commit it itself during
+            // `interpretKeyEvents:`, commit the captured preedit so that
+            // pressing Alt+key for navigation doesn't silently discard the
+            // user's in-progress text.
+            if let Some(preedit) = preedit_at_start {
+                if !self.ivars().current_keydown_committed_via_ime.get() {
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                    self.queue_event(WindowEvent::Ime(Ime::Commit(preedit)));
+                    self.ivars().ime_state.set(ImeState::Committed);
                 }
             }
 
@@ -803,6 +888,8 @@ impl WinitView {
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
+            current_keydown_alt_held: Default::default(),
+            current_keydown_committed_via_ime: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
@@ -853,6 +940,43 @@ impl WinitView {
             .selectedKeyboardInputSource()
             .map(|input_source| input_source.to_string())
             .unwrap_or_default()
+    }
+
+    /// Returns `true` when the current keyboard input source is an input
+    /// method (e.g. Korean Gureum, Japanese Kotoeri) rather than a plain
+    /// keyboard layout (e.g. US Qwerty, Dvorak).
+    ///
+    /// We use this to decide whether `insertText:` calls without preceding
+    /// marked text should be treated as IME commits. Korean IMEs like
+    /// Gureum deliver punctuation (`.`, `,`, `;`) via `insertText:` even
+    /// when no Hangul is being composed, and routing those through
+    /// `Ime::Commit` prevents the underlying layout (e.g. Dvorak) from
+    /// reinterpreting the physical key on the way out via `NSEvent.characters`.
+    ///
+    /// Note: `kTISPropertyInputSourceCategory` is too coarse — both plain
+    /// keyboard layouts and IMEs share the `kTISCategoryKeyboardInputSource`
+    /// category. `kTISPropertyInputSourceType` is the right discriminator,
+    /// where `kTISTypeKeyboardLayout` identifies plain layouts and any
+    /// other type identifies an IME variant.
+    fn is_input_source_ime(&self) -> bool {
+        unsafe {
+            let source = super::ffi::TISCopyCurrentKeyboardInputSource();
+            if source.is_null() {
+                return false;
+            }
+            let ty = super::ffi::TISGetInputSourceProperty(
+                source,
+                super::ffi::kTISPropertyInputSourceType,
+            );
+            let is_layout = !ty.is_null()
+                && core_foundation::base::CFEqual(
+                    ty as core_foundation::base::CFTypeRef,
+                    super::ffi::kTISTypeKeyboardLayout as core_foundation::base::CFTypeRef,
+                ) != 0;
+            let is_ime = !ty.is_null() && !is_layout;
+            core_foundation::base::CFRelease(source as *mut std::ffi::c_void);
+            is_ime
+        }
     }
 
     pub(super) fn cursor_icon(&self) -> Retained<NSCursor> {
